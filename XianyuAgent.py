@@ -1,8 +1,9 @@
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 import os
 from openai import OpenAI
 from loguru import logger
+from dialog.dialog_agent import DialogAgent
 
 
 class XianyuReplyBot:
@@ -20,11 +21,13 @@ class XianyuReplyBot:
 
     def _init_agents(self):
         """初始化各领域Agent"""
+        from dialog.dialog_agent import DialogAgent
         self.agents = {
             'classify':ClassifyAgent(self.client, self.classify_prompt, self._safe_filter),
             'price': PriceAgent(self.client, self.price_prompt, self._safe_filter),
             'tech': TechAgent(self.client, self.tech_prompt, self._safe_filter),
             'default': DefaultAgent(self.client, self.default_prompt, self._safe_filter),
+            'hotel': HotelAgent(self.client),
         }
 
     def _init_system_prompts(self):
@@ -153,12 +156,34 @@ class IntentRouter:
             'tech': {  # 技术类优先判定
                 'keywords': ['参数', '规格', '型号', '连接', '对比'],
                 'patterns': [
-                    r'和.+比'             
+                    r'和.+比'
                 ]
             },
             'price': {
                 'keywords': ['便宜', '价', '砍价', '少点'],
                 'patterns': [r'\d+元', r'能少\d+']
+            },
+            'hotel': {
+                'keywords': ['酒店', '宾馆', '住宿', '入住', '退房', '房', '旅馆'],
+                'patterns': [
+                    r'[北京|上海|广州|深圳|杭州|南京|武汉|重庆|成都|西安|大连|厦门|青岛|济南|长沙|沈阳|天津|郑州|合肥|昆明|南宁|南昌|哈尔滨|长春|石家庄|太原|贵阳|海口|兰州|银川|西宁|乌鲁木齐|呼和浩特|拉萨][\w]*酒店',
+                    r'(\d+)月(\d+)日.*入住',
+                    r'住(\d+)晚',
+                    r'预订.*房间',
+                    r'房价',
+                    r'房型',
+                    r'退房.*时间',
+                    r'订单.*号',
+                    r'预订.*号',
+                    r'入住.*登记',
+                    r'退房.*手续',
+                    r'押金.*金额',
+                    r'发票.*抬头',
+                    r'开发票',
+                    r'早餐.*券',
+                    r'停车.*费',
+                    r'WiFi.*密码'
+                ]
             }
         }
         self.classify_agent = classify_agent
@@ -166,36 +191,84 @@ class IntentRouter:
     def detect(self, user_msg: str, item_desc, context) -> str:
         """三级路由策略（技术优先）"""
         text_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '', user_msg)
-        
+
         # 1. 技术类关键词优先检查
         if any(kw in text_clean for kw in self.rules['tech']['keywords']):
-            # logger.debug(f"技术类关键词匹配: {[kw for kw in self.rules['tech']['keywords'] if kw in text_clean]}")
             return 'tech'
-            
+
         # 2. 技术类正则优先检查
         for pattern in self.rules['tech']['patterns']:
             if re.search(pattern, text_clean):
-                # logger.debug(f"技术类正则匹配: {pattern}")
                 return 'tech'
 
-        # 3. 价格类检查
+        # 3. 酒店类检查
+        if any(kw in text_clean for kw in self.rules['hotel']['keywords']):
+            return 'hotel'
+
+        for pattern in self.rules['hotel']['patterns']:
+            if re.search(pattern, text_clean):
+                return 'hotel'
+
+        # 4. 价格类检查
         for intent in ['price']:
             if any(kw in text_clean for kw in self.rules[intent]['keywords']):
-                # logger.debug(f"价格类关键词匹配: {[kw for kw in self.rules[intent]['keywords'] if kw in text_clean]}")
                 return intent
-            
+
             for pattern in self.rules[intent]['patterns']:
                 if re.search(pattern, text_clean):
-                    # logger.debug(f"价格类正则匹配: {pattern}")
                     return intent
-        
-        # 4. 大模型兜底
-        # logger.debug("使用大模型进行意图分类")
+
+        # 5. 大模型兜底
+        logger.debug("使用大模型进行意图分类")
         return self.classify_agent.generate(
             user_msg=user_msg,
             item_desc=item_desc,
             context=context
         )
+
+
+class HotelAgent:
+    """酒店预订Agent"""
+
+    def __init__(self, client: Optional[OpenAI] = None):
+        """
+        初始化酒店Agent
+        Args:
+            client: OpenAI客户端（可选）
+        """
+        self.client = client
+        self.dialog_agents = {}
+        logger.info("HotelAgent initialized")
+
+    def generate(self, user_msg: str, item_desc: str, context: str, **kwargs) -> str:
+        """
+        处理酒店相关意图
+        Args:
+            user_msg: 用户消息
+            item_desc: 商品描述
+            context: 对话历史
+            **kwargs: 其他参数
+        Returns:
+            回复内容
+        """
+        # 获取或创建DialogAgent
+        chat_id = "default_chat"
+        user_id = "default_user"
+
+        if chat_id not in self.dialog_agents:
+            self.dialog_agents[chat_id] = DialogAgent(chat_id, user_id)
+            logger.debug(f"Created new DialogAgent for chat_id: {chat_id}")
+
+        dialog_agent = self.dialog_agents[chat_id]
+
+        # 处理用户消息
+        try:
+            reply = dialog_agent.process_message(user_msg)
+            logger.debug(f"DialogAgent replied: {reply}")
+            return reply
+        except Exception as e:
+            logger.error(f"Error processing message with DialogAgent: {e}")
+            return "很抱歉，处理您的请求时发生了错误，请稍后再试。"
 
 
 class BaseAgent:

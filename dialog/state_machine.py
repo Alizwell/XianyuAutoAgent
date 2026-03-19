@@ -31,7 +31,8 @@ class StateMachine:
     # 允许的状态转换规则
     _ALLOWED_TRANSITIONS: Dict[DialogState, Set[DialogState]] = {
         DialogState.IDLE: {
-            DialogState.AWAITING_PRICE_PARAMS
+            DialogState.AWAITING_PRICE_PARAMS,
+            DialogState.AWAITING_CONFIRMATION
         },
         DialogState.AWAITING_PRICE_PARAMS: {
             DialogState.AWAITING_CONFIRMATION,

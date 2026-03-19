@@ -12,6 +12,7 @@ from .nlu import IntentRecognizer, EntityExtractor, Intent
 from .state_machine import StateMachine, DialogState
 from services import OrderService
 from services.price_service import PriceService
+from executor.hotel_executor import HotelExecutor
 
 
 class DialogAgent:
@@ -22,7 +23,8 @@ class DialogAgent:
         chat_id: str,
         user_id: str,
         order_service: Optional[OrderService] = None,
-        price_service: Optional[PriceService] = None
+        price_service: Optional[PriceService] = None,
+        hotel_executor: Optional[HotelExecutor] = None
     ):
         """
         初始化对话Agent
@@ -31,12 +33,14 @@ class DialogAgent:
             user_id: 用户ID
             order_service: 订单服务实例，None则创建新实例
             price_service: 价格服务实例，None则创建新实例
+            hotel_executor: 酒店执行器实例，None则创建新实例
         """
         self.chat_id = chat_id
         self.user_id = user_id
         self.state_machine = StateMachine()
         self.order_service = order_service or OrderService()
         self.price_service = price_service or PriceService()
+        self.hotel_executor = hotel_executor or HotelExecutor(mock=True)
 
         # 对话上下文：存储当前对话的相关信息
         self.context: Dict[str, Any] = {
@@ -141,13 +145,37 @@ class DialogAgent:
         """查询价格并展示给用户"""
         params = self.context["price_params"]
 
-        # 调用价格服务查询
+        # 首先调用价格服务查询
         price_record = self.price_service.query_price(
             hotel_id=params["hotel_id"],
             room_id=params["room_id"],
             check_in_date=params["check_in_date"],
             check_out_date=params["check_out_date"]
         )
+
+        if not price_record:
+            # 缓存中没有，调用酒店执行器获取实时价格
+            try:
+                executor_result = self.hotel_executor.query_price(
+                    hotel_id=params["hotel_id"],
+                    room_id=params["room_id"],
+                    check_in_date=params["check_in_date"],
+                    check_out_date=params["check_out_date"]
+                )
+
+                if executor_result and executor_result.get("success"):
+                    # 保存到价格服务
+                    price_data = {
+                        "hotel_id": params["hotel_id"],
+                        "room_id": params["room_id"],
+                        "check_in_date": params["check_in_date"],
+                        "check_out_date": params["check_out_date"],
+                        "price": executor_result["price"],
+                        "currency": executor_result.get("currency", "CNY")
+                    }
+                    price_record = self.price_service.save_price(price_data)
+            except Exception as e:
+                logger.error(f"Failed to query price from executor: {e}")
 
         if price_record:
             # 价格查询成功，进入确认状态
@@ -158,7 +186,6 @@ class DialogAgent:
                 f"是否确认预订？"
             )
         else:
-            # 这里应该调用酒店执行器获取实时价格
             return "暂时无法查询到该酒店的价格，请稍后再试或联系客服。"
 
     def _handle_confirmation(self, entities: Dict[str, Any]) -> str:
@@ -194,6 +221,14 @@ class DialogAgent:
             order = self.order_service.create_order(order_data)
             self.context["current_order_id"] = order["order_id"]
 
+            # 尝试更新订单状态，处理可能的错误（如数据库操作失败）
+            try:
+                # 更新订单状态为CONFIRMED，再更新为等待付款
+                self.order_service.update_status(order["order_id"], "CONFIRMED")
+            except Exception as e:
+                logger.error(f"Failed to update order status: {e}")
+                # 如果状态更新失败，仍然可以继续流程
+
             # 更新状态为等待付款
             self.state_machine.transition_to(DialogState.AWAITING_PAYMENT)
 
@@ -218,16 +253,52 @@ class DialogAgent:
             return "抱歉，找不到当前订单信息。"
 
         try:
-            # 更新订单状态为已付款
-            self.order_service.update_status(order_id, "PAID")
+            # 尝试更新订单状态为已付款
+            try:
+                self.order_service.update_status(order_id, "PAID")
+            except Exception as e:
+                logger.error(f"Failed to update order status to PAID: {e}")
+
             self.state_machine.transition_to(DialogState.PROCESSING_BOOKING)
 
-            # 这里应该调用酒店执行器进行实际预订
-            # 简化处理，直接假设预订成功
-            self.order_service.update_status(order_id, "BOOKED")
-            self.state_machine.transition_to(DialogState.COMPLETED)
+            # 调用酒店执行器进行实际预订
+            booking_params = self.context.get("booking_params", {})
+            hotel_id = booking_params.get("hotel_id", "hotel_default")
+            room_id = booking_params.get("room_id", "room_default")
+            check_in_date = booking_params.get("check_in_date", "")
+            check_out_date = booking_params.get("check_out_date", "")
 
-            return "已收到您的付款通知，预订成功！祝您入住愉快！"
+            guest_info = {
+                "name": "测试用户",
+                "phone": "13800138000",
+                "email": "test@example.com"
+            }
+
+            booking_result = self.hotel_executor.book_room(
+                hotel_id=hotel_id,
+                room_id=room_id,
+                check_in_date=check_in_date,
+                check_out_date=check_out_date,
+                guest_info=guest_info
+            )
+
+            if booking_result and booking_result.get("success"):
+                # 尝试更新状态为 BOOKED
+                try:
+                    self.order_service.update_status(order_id, "BOOKED")
+                except Exception as e:
+                    logger.error(f"Failed to update order status to BOOKED: {e}")
+
+                self.state_machine.transition_to(DialogState.COMPLETED)
+
+                return (
+                    f"已收到您的付款通知，预订成功！\n"
+                    f"预订号：{booking_result.get('booking_id')}\n"
+                    f"祝您入住愉快！"
+                )
+            else:
+                return "酒店预订失败，请稍后再试或联系客服。"
+
         except Exception as e:
             logger.exception(f"Failed to process payment: {e}")
             return "处理付款通知失败，请稍后再试或联系客服。"

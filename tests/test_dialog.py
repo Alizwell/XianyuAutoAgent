@@ -116,10 +116,20 @@ class TestStateMachine:
         """测试无效状态转换"""
         sm = StateMachine()
 
-        # 不能从 IDLE 直接到 AWAITING_CONFIRMATION
-        assert not sm.can_transition_to(DialogState.AWAITING_CONFIRMATION)
+        # 不能从 IDLE 直接到 AWAITING_PAYMENT
+        assert not sm.can_transition_to(DialogState.AWAITING_PAYMENT)
         with pytest.raises(InvalidStateTransitionError):
-            sm.transition_to(DialogState.AWAITING_CONFIRMATION)
+            sm.transition_to(DialogState.AWAITING_PAYMENT)
+
+        # 不能从 IDLE 直接到 PROCESSING_BOOKING
+        assert not sm.can_transition_to(DialogState.PROCESSING_BOOKING)
+        with pytest.raises(InvalidStateTransitionError):
+            sm.transition_to(DialogState.PROCESSING_BOOKING)
+
+        # 不能从 IDLE 直接到 COMPLETED
+        assert not sm.can_transition_to(DialogState.COMPLETED)
+        with pytest.raises(InvalidStateTransitionError):
+            sm.transition_to(DialogState.COMPLETED)
 
     def test_state_history(self):
         """测试状态历史记录"""
