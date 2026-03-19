@@ -5,7 +5,9 @@
 提供业务层服务接口
 """
 from .order_service import OrderService
+from .price_service import PriceService
 
 __all__ = [
-    "OrderService"
+    "OrderService",
+    "PriceService"
 ]
