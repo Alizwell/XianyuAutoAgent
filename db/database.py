@@ -37,12 +37,14 @@ class Database:
         try:
             self.connect()
             # 读取并执行schema.sql
-            schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+            schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
             if os.path.exists(schema_path):
                 with open(schema_path, "r") as f:
                     schema_sql = f.read()
                 self._cursor.executescript(schema_sql)
                 self._conn.commit()
+            else:
+                print("Warning: schema.sql not found at %s" % schema_path)
         except Exception as e:
             print("Error ensuring tables: %s" % e)
             if self._conn:
@@ -240,10 +242,14 @@ class Database:
         )
         params = list(data.values())
 
-        if self.execute(sql, params) is not None:
+        try:
+            result = self.execute(sql, params)
+            if result is not None:
+                return -1
+            return self.get_last_insert_id()
+        except Exception as e:
+            print(f"Insert error: {e}")
             return -1
-
-        return self.get_last_insert_id()
 
     def update(self, table, data, conditions):
         """
@@ -262,9 +268,18 @@ class Database:
         )
 
         params = list(data.values()) + list(conditions.values())
-        original_count = self._cursor.rowcount
-        self.execute(sql, params)
-        return self._cursor.rowcount - original_count
+
+        # 先查询有多少符合条件的记录
+        count_sql = "SELECT COUNT(*) FROM {table} WHERE {where_clause}".format(
+            table=table, where_clause=where_clause
+        )
+        count_params = list(conditions.values())
+        count_result = self.execute(count_sql, count_params)
+        if count_result:
+            affected = count_result[0]['COUNT(*)']
+            self.execute(sql, params)
+            return affected
+        return 0
 
     def delete(self, table, conditions):
         """
