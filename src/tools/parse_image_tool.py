@@ -21,6 +21,32 @@ class ParseImageTool(BaseTool):
         image_type: str = "screenshot",
         **kwargs
     ) -> ToolResult:
+        """
+        执行图片解析
+
+        Args:
+            image_url: 图片URL（可选）
+            image_base64: 图片Base64编码（可选）
+            image_type: 图片类型（保持向后兼容，当前版本不使用）
+            **kwargs: 其他参数
+
+        Returns:
+            ToolResult: 解析结果
+
+        Note: image_type参数保持向后兼容，但新版本服务不再使用
+        """
+        # 验证必需参数
+        error = self.validate_params(
+            ['image_url', 'image_base64'],  # 至少提供一个
+            {
+                'image_url': image_url,
+                'image_base64': image_base64
+            },
+            require_at_least_one=True
+        )
+        if error:
+            return ToolResult.error_result(error)
+
         try:
             result = await self.extraction_service.extract_from_image(
                 image_url=image_url,

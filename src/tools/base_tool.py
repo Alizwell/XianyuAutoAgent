@@ -43,18 +43,28 @@ class BaseTool(ABC):
         """
         pass
 
-    def validate_params(self, required_params: list, provided_params: dict) -> Optional[str]:
+    def validate_params(self, required_params: list, provided_params: dict, require_at_least_one: bool = False) -> Optional[str]:
         """
         验证参数
 
         Args:
             required_params: 必需参数列表
             provided_params: 提供的参数
+            require_at_least_one: 是否至少需要提供一个参数（而不是全部）
 
         Returns:
             错误信息，如果验证通过返回None
         """
-        missing = [p for p in required_params if p not in provided_params or provided_params[p] is None]
-        if missing:
-            return f"Missing required parameters: {', '.join(missing)}"
+        if require_at_least_one:
+            # 检查是否至少提供了一个参数
+            has_valid_param = any(
+                provided_params.get(p) is not None for p in required_params
+            )
+            if not has_valid_param:
+                return f"At least one of the following parameters is required: {', '.join(required_params)}"
+        else:
+            # 检查所有参数是否都提供了
+            missing = [p for p in required_params if p not in provided_params or provided_params[p] is None]
+            if missing:
+                return f"Missing required parameters: {', '.join(missing)}"
         return None
