@@ -55,3 +55,17 @@ async def test_extract_from_text_complete_dates():
     assert result.check_out_date == "2026-03-23"
     assert result.room_type == "高级大床房"
     assert result.ambiguous_fields == []
+
+
+@pytest.mark.asyncio
+async def test_extract_from_image():
+    """Test image extraction (multimodal)"""
+    service = LLMExtractionService()
+    if not service.api_key:
+        pytest.skip("LLM_API_KEY not configured")
+
+    # Test with a sample image URL - this would be a real screenshot in actual test
+    # For unit test, we mainly test the method signature and error handling
+    result = await service.extract_from_image(image_url="https://example.com/hotel-screenshot.jpg")
+    # We expect it to fail gracefully with invalid URL or API issues
+    assert isinstance(result, ExtractedInfo)

@@ -213,7 +213,112 @@ class LLMExtractionService:
             logger.warning("Neither text nor image provided for extraction")
             return ExtractedInfo()
 
-    async def extract_from_image(self, image_url: Optional[str], image_base64: Optional[str]) -> ExtractedInfo:
-        """Extract information from image (to be implemented in Task 3)"""
-        logger.warning("Image extraction not implemented yet")
+    def _build_image_prompt(self) -> str:
+        return f'''请分析这张酒店预订相关的图片，提取以下信息：
+
+提取以下字段：
+1. 酒店名称 (hotel_name) - 完整提取图片中提到的酒店名称
+2. 入住日期 (check_in_date) - 请转换为 YYYY-MM-DD 格式
+3. 离店日期 (check_out_date) - 请转换为 YYYY-MM-DD 格式
+4. 房型 (room_type) - 图片中提到的房型，如：高级大床房、双床房等
+5. 价格 (price) - 价格数字，单位元
+
+规则：
+- 如果某字段无法确定，请设置为 null
+- 价格请提取为数字类型（不是字符串）
+- 如果日期只有日月缺少年份月份，请设置该字段为 null，加入 ambiguous_fields
+- 如果只给出一个日期范围如 "22-23号"，两个日期都缺年月，都加入 ambiguous_fields
+- confidence 字段给出每个字段的置信度（0.0-1.0）
+- 置信度 < {self.confidence_threshold} 的字段请设为 null
+
+请严格以JSON格式输出：
+
+{{
+  "hotel_name": "酒店名称或null",
+  "check_in_date": "YYYY-MM-DD或null",
+  "check_out_date": "YYYY-MM-DD或null",
+  "room_type": "房型名称或null",
+  "price": 299 或 null,
+  "confidence": {{
+    "hotel_name": 0.95,
+    "check_in_date": 0.80,
+    "check_out_date": 0.80,
+    "room_type": 0.90,
+    "price": 0.85
+  }},
+  "ambiguous_fields": ["check_in_date", "check_out_date"]
+}}
+
+如果没有歧义，ambiguous_fields 为空数组 []。'''
+
+    async def extract_from_image(
+        self,
+        image_url: Optional[str] = None,
+        image_base64: Optional[str] = None,
+    ) -> ExtractedInfo:
+        """Extract hotel information from image using multimodal LLM"""
+        # Input validation
+        if not image_url and not image_base64:
+            logger.warning("Neither image_url nor image_base64 provided")
+            return ExtractedInfo()
+
+        # Build image content
+        if image_url:
+            image_content = {
+                "type": "image_url",
+                "image_url": {"url": image_url}
+            }
+        else:  # image_base64
+            image_content = {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+            }
+
+        prompt = self._build_image_prompt()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    image_content
+                ]
+            }
+        ]
+
+        for attempt in range(self.max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.post(
+                        f"{self.api_base}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": self.vision_model,
+                            "messages": messages,
+                            "max_tokens": 1000,
+                            "temperature": 0.0,
+                        },
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    content = result['choices'][0]['message']['content']
+                    return self._parse_json_response(content)
+
+            except (HTTPStatusError, NetworkError, TimeoutException) as e:
+                if attempt == self.max_retries - 1:
+                    logger.error(f"Image extraction failed after {self.max_retries} attempts: {str(e)}")
+                    return ExtractedInfo()
+                await asyncio.sleep(1 + attempt * 2)
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    logger.error(f"Image extraction failed after {self.max_retries} attempts: {str(e)}")
+                    return ExtractedInfo()
+                await asyncio.sleep(1 + attempt * 2)
+
         return ExtractedInfo()
+
+    async def close(self):
+        """Cleanup resources - currently no persistent connections"""
+        pass
