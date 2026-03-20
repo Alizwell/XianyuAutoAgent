@@ -1,4 +1,5 @@
 import pytest
+import asyncio
 from src.services.llm_extraction_service import ExtractedInfo, LLMExtractionService
 
 
@@ -24,3 +25,33 @@ def test_extracted_info_set_values():
 
     assert info.hotel_name == "汉庭厦门中山路轮渡酒店"
     assert "check_out_date" in info.ambiguous_fields
+
+
+@pytest.mark.asyncio
+async def test_extract_from_text_basic():
+    """Test basic text extraction"""
+    service = LLMExtractionService()
+    # This test requires LLM API, skip if no API key
+    if not service.api_key:
+        pytest.skip("LLM_API_KEY not configured")
+
+    result = await service.extract_from_text("汉庭厦门中山路轮渡酒店 22-23号，高级大床房")
+    assert result.hotel_name == "汉庭厦门中山路轮渡酒店"
+    assert "check_in_date" in result.ambiguous_fields
+    assert "check_out_date" in result.ambiguous_fields
+    assert result.room_type == "高级大床房"
+
+
+@pytest.mark.asyncio
+async def test_extract_from_text_complete_dates():
+    """Test extraction with complete dates"""
+    service = LLMExtractionService()
+    if not service.api_key:
+        pytest.skip("LLM_API_KEY not configured")
+
+    result = await service.extract_from_text("汉庭厦门中山路 2026-03-22 2026-03-23 高级大床房")
+    assert result.hotel_name == "汉庭厦门中山路"
+    assert result.check_in_date == "2026-03-22"
+    assert result.check_out_date == "2026-03-23"
+    assert result.room_type == "高级大床房"
+    assert result.ambiguous_fields == []
