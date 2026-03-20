@@ -205,8 +205,13 @@ class IntentRouter:
 
     def detect(self, user_msg: str, item_desc, context) -> str:
         """三级路由策略（技术优先）"""
+        # 如果用户发送图片（占位符[图片]），默认按酒店价格查询处理
+        if '[图片]' in user_msg:
+            logger.debug("用户发送图片，默认按酒店价格查询处理")
+            return 'hotel_query'
+
         text_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '', user_msg)
-        
+
         # 1. 技术类关键词优先检查
         if any(kw in text_clean for kw in self.rules['tech']['keywords']):
             # logger.debug(f"技术类关键词匹配: {[kw for kw in self.rules['tech']['keywords'] if kw in text_clean]}")

@@ -179,7 +179,7 @@ class HotelPriceAgent:
         step = state.current_step
 
         if step == QueryStep.AWAITING_HOTEL_NAME:
-            return {'reply': "请问您要查询哪家酒店？"}
+            return {'reply': "未能从图片中识别出有效的酒店信息，请提供您要预订的酒店名称、入住日期、离店日期和房型信息。例如：汉庭厦门中山路轮渡酒店 2026-03-22 2026-03-23 高级大床房"}
 
         elif step == QueryStep.AWAITING_CHECKIN_DATE:
             return {'reply': f"好的，{state.hotel_name}。请问您的入住日期是哪天？请提供YYYY-MM-DD格式。"}
