@@ -224,13 +224,24 @@ class IntentRouter:
             if any(kw in text_clean for kw in self.rules[intent]['keywords']):
                 # logger.debug(f"价格类关键词匹配: {[kw for kw in self.rules[intent]['keywords'] if kw in text_clean]}")
                 return intent
-            
+
             for pattern in self.rules[intent]['patterns']:
                 if re.search(pattern, text_clean):
                     # logger.debug(f"价格类正则匹配: {pattern}")
                     return intent
-        
-        # 4. 大模型兜底
+
+        # 4. 酒店查询检查
+        for intent in ['hotel_query']:
+            if any(kw in text_clean for kw in self.rules[intent]['keywords']):
+                logger.debug(f"酒店查询关键词匹配: {[kw for kw in self.rules[intent]['keywords'] if kw in text_clean]}")
+                return intent
+
+            for pattern in self.rules[intent]['patterns']:
+                if re.search(pattern, text_clean):
+                    logger.debug(f"酒店查询正则匹配: {pattern}")
+                    return intent
+
+        # 5. 大模型兜底
         # logger.debug("使用大模型进行意图分类")
         return self.classify_agent.generate(
             user_msg=user_msg,

@@ -245,14 +245,20 @@ class XianyuLive:
             return False
     
     def is_bracket_system_message(self, message):
-        """检查是否为带中括号的系统消息"""
+        """检查是否为带中括号的系统消息
+        注意：[图片] 是用户发送的图片占位符，不属于系统消息，需要放行
+        """
         try:
             if not message or not isinstance(message, str):
                 return False
-            
+
             clean_message = message.strip()
             # 检查是否以 [ 开头，以 ] 结尾
             if clean_message.startswith('[') and clean_message.endswith(']'):
+                # [图片] 是用户发送的图片，不是系统消息，需要放行
+                if clean_message == '[图片]':
+                    logger.debug(f"用户发送图片占位符: {clean_message}，继续处理")
+                    return False
                 logger.debug(f"检测到系统消息: {clean_message}")
                 return True
             return False
@@ -507,20 +513,30 @@ class XianyuLive:
             
             # 获取完整的对话上下文
             context = self.context_manager.get_context_by_chat(chat_id)
+            # 提取图片数据（目前在web端消息中只拿到占位符，实际图片URL需要额外获取）
+            # 传递 None 给酒店价格agent，它会根据 [图片] 文本识别用户意图
+            image_url = None
+            image_base64 = None
+
+            # 添加用户消息到上下文（提前添加，这样bot能看到完整上下文）
+            self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
+
+            # 获取完整的对话上下文
+            context = self.context_manager.get_context_by_chat(chat_id)
+
             # 生成回复
             bot_reply = bot.generate_reply(
                 send_message,
                 item_description,
-                context=context
+                context=context,
+                image_url=image_url,
+                image_base64=image_base64
             )
-            
+
             # 检查是否需要回复
             if bot_reply == "-":
                 logger.info(f"[无需回复] 用户 {send_user_name} 的消息被识别为无需回复类型")
                 return
-            
-            # 添加用户消息到上下文
-            self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
             
             # 检查是否为价格意图，如果是则增加议价次数
             if bot.last_intent == "price":
