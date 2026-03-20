@@ -1,8 +1,9 @@
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 import os
 from openai import OpenAI
 from loguru import logger
+from src.agent.hotel_price_agent import HotelPriceAgent
 
 
 class XianyuReplyBot:
@@ -16,6 +17,8 @@ class XianyuReplyBot:
         self._init_agents()
         self.router = IntentRouter(self.agents['classify'])
         self.last_intent = None  # 记录最后一次意图
+        # 初始化酒店价格查询Agent
+        self.hotel_price_agent = HotelPriceAgent()
 
 
     def _init_agents(self):
@@ -25,6 +28,7 @@ class XianyuReplyBot:
             'price': PriceAgent(self.client, self.price_prompt, self._safe_filter),
             'tech': TechAgent(self.client, self.tech_prompt, self._safe_filter),
             'default': DefaultAgent(self.client, self.default_prompt, self._safe_filter),
+            'hotel_query': None,  # 单独初始化在__init__
         }
 
     def _init_system_prompts(self):
@@ -72,20 +76,40 @@ class XianyuReplyBot:
         user_assistant_msgs = [msg for msg in context if msg['role'] in ['user', 'assistant']]
         return "\n".join([f"{msg['role']}: {msg['content']}" for msg in user_assistant_msgs])
 
-    def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict]) -> str:
+    def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict], image_url: Optional[str] = None, image_base64: Optional[str] = None) -> str:
         """生成回复主流程"""
         # 记录用户消息
         # logger.debug(f'用户所发消息: {user_msg}')
-        
+
         formatted_context = self.format_history(context)
         # logger.debug(f'对话历史: {formatted_context}')
-        
+
         # 1. 路由决策
         detected_intent = self.router.detect(user_msg, item_desc, formatted_context)
 
 
+        # 2. 特殊处理：酒店价格查询
+        if detected_intent == 'hotel_query':
+            logger.info(f'意图识别完成: hotel_query')
+            self.last_intent = 'hotel_query'
 
-        # 2. 获取对应Agent
+            # 使用会话ID（从上下文中获取，或者使用第一个消息ID）
+            session_id = self._get_session_id(context)
+
+            import asyncio
+            result = asyncio.run(self.hotel_price_agent.process_message(
+                session_id=session_id,
+                user_message=user_msg,
+                image_url=image_url,
+                image_base64=image_base64
+            ))
+
+            reply = result['reply']
+            logger.info(f'酒店查询完成: 状态={result["state"]["current_step"]}')
+
+            return self._safe_filter(reply)
+
+        # 3. 获取对应Agent
 
         internal_intents = {'classify'}  # 定义不对外开放的Agent
 
@@ -102,18 +126,26 @@ class XianyuReplyBot:
             agent = self.agents['default']
             logger.info(f'意图识别完成: default')
             self.last_intent = 'default'  # 保存当前意图
-        
-        # 3. 获取议价次数
+
+        # 4. 获取议价次数
         bargain_count = self._extract_bargain_count(context)
         logger.info(f'议价次数: {bargain_count}')
 
-        # 4. 生成回复
+        # 5. 生成回复
         return agent.generate(
             user_msg=user_msg,
             item_desc=item_desc,
             context=formatted_context,
             bargain_count=bargain_count
         )
+
+    def _get_session_id(self, context: List[Dict]) -> str:
+        """从上下文中获取会话ID"""
+        # 简单实现：使用第一个消息的哈希作为会话ID
+        if context:
+            first_msg = context[0].get('content', '')
+            return str(hash(first_msg))[:16]
+        return 'default'
     
     def _extract_bargain_count(self, context: List[Dict]) -> int:
         """
@@ -153,12 +185,21 @@ class IntentRouter:
             'tech': {  # 技术类优先判定
                 'keywords': ['参数', '规格', '型号', '连接', '对比'],
                 'patterns': [
-                    r'和.+比'             
+                    r'和.+比'
                 ]
             },
             'price': {
                 'keywords': ['便宜', '价', '砍价', '少点'],
                 'patterns': [r'\d+元', r'能少\d+']
+            },
+            'hotel_query': {  # 酒店价格查询
+                'keywords': ['酒店', '代订', '价格', '查询', '哪天', '日期', '房型', '入住'],
+                'patterns': [
+                    r'.*酒店.*价格',
+                    r'.*入住.*日期',
+                    r'.*房型.*多少钱',
+                    r'.*什么房型'
+                ]
             }
         }
         self.classify_agent = classify_agent
