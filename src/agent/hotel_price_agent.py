@@ -11,6 +11,7 @@ from src.tools import (
     ParseImageTool
 )
 from src.agent.state_manager import StateManager
+from src.services import LLMExtractionService, ExtractedInfo
 
 
 class HotelPriceAgent:
@@ -21,7 +22,8 @@ class HotelPriceAgent:
         state_manager: Optional[StateManager] = None,
         search_hotel_tool: Optional[SearchHotelTool] = None,
         query_price_tool: Optional[QueryPriceTool] = None,
-        parse_image_tool: Optional[ParseImageTool] = None
+        parse_image_tool: Optional[ParseImageTool] = None,
+        extraction_service: Optional[LLMExtractionService] = None,
     ):
         """
         初始化Agent
@@ -31,11 +33,13 @@ class HotelPriceAgent:
             search_hotel_tool: 搜索酒店工具
             query_price_tool: 查询价格工具
             parse_image_tool: 解析图片工具
+            extraction_service: 统一LLM信息提取服务
         """
         self.state_manager = state_manager or StateManager()
         self.search_hotel_tool = search_hotel_tool or SearchHotelTool()
         self.query_price_tool = query_price_tool or QueryPriceTool()
         self.parse_image_tool = parse_image_tool or ParseImageTool()
+        self.extraction_service = extraction_service or LLMExtractionService()
 
     async def process_message(
         self,
@@ -61,12 +65,31 @@ class HotelPriceAgent:
         if not state:
             state = self.state_manager.create_state(session_id)
 
-        # 如果有图片，先解析图片
-        if image_url or image_base64:
-            await self._parse_image(state, image_url, image_base64)
+        # Use unified LLM extraction for both text and image
+        extracted = await self.extraction_service.extract(
+            text=user_message,
+            image_url=image_url,
+            image_base64=image_base64
+        )
 
-        # 解析用户文本，提取信息
-        self._extract_info_from_text(state, user_message)
+        # Fill extracted info into state - only fill if not already set and confidence good
+        if extracted.hotel_name and not state.hotel_name:
+            state.hotel_name = extracted.hotel_name
+        if extracted.check_in_date and not state.check_in_date:
+            normalized = self._normalize_date(extracted.check_in_date)
+            state.check_in_date = normalized
+        if extracted.check_out_date and not state.check_out_date:
+            normalized = self._normalize_date(extracted.check_out_date)
+            state.check_out_date = normalized
+        if extracted.room_type and not state.room_type:
+            state.room_type = extracted.room_type
+        if extracted.price:
+            # Store price if extracted for reference
+            pass
+
+        # LLM already identified ambiguous fields - ambiguous fields are already null
+        # so _advance_to_missing_step will handle asking user to confirm
+        self._advance_to_missing_step(state)
 
         # 根据当前步骤处理
         result = await self._process_by_step(state)
@@ -78,88 +101,10 @@ class HotelPriceAgent:
             'reply': result['reply'],
             'complete': state.current_step == QueryStep.COMPLETE,
             'state': state.to_dict(),
-            'result': result.get('result')
+            'result': result.get('result'),
+            'ambiguous_fields': extracted.ambiguous_fields,
         }
 
-    async def _parse_image(
-        self,
-        state: QueryState,
-        image_url: Optional[str],
-        image_base64: Optional[str]
-    ):
-        """解析图片"""
-        state.update_step(QueryStep.PARSING_IMAGE)
-
-        result = await self.parse_image_tool.execute(
-            image_url=image_url,
-            image_base64=image_base64
-        )
-
-        if result.success:
-            data = result.data
-            # 填充提取的信息
-            if data.get('hotel_name') and data['confidence'].get('hotel_name', 0) >= 0.5:
-                state.hotel_name = data['hotel_name']
-            if data.get('check_in_date') and data['confidence'].get('check_in_date', 0) >= 0.5:
-                state.check_in_date = self._normalize_date(data['check_in_date'])
-            if data.get('check_out_date') and data['confidence'].get('check_out_date', 0) >= 0.5:
-                state.check_out_date = self._normalize_date(data['check_out_date'])
-            if data.get('room_type') and data['confidence'].get('room_type', 0) >= 0.5:
-                state.room_type = data['room_type']
-
-            state.image_parse_result = data
-
-    def _extract_info_from_text(self, state: QueryState, text: str):
-        """从文本提取信息"""
-        text_lower = text.lower()
-
-        # 提取日期
-        # 简单实现：匹配 YYYY-MM-DD 格式
-        import re
-        dates = re.findall(r'\d{4}-\d{2}-\d{2}', text)
-        if len(dates) >= 2:
-            if not state.check_in_date:
-                state.check_in_date = dates[0]
-            if not state.check_out_date:
-                state.check_out_date = dates[1]
-        elif len(dates) == 1:
-            if not state.check_in_date:
-                state.check_in_date = dates[0]
-                # 默认离店日期是入住后一天
-                next_day = datetime.strptime(dates[0], '%Y-%m-%d') + timedelta(days=1)
-                if not state.check_out_date:
-                    state.check_out_date = next_day.strftime('%Y-%m-%d')
-
-        # 房型关键词
-        room_type_keywords = [
-            '大床', '双床', '套房', '家庭房', '标准间', '高级',
-            '豪华', '行政', '景观', '城景', '海景'
-        ]
-        for keyword in room_type_keywords:
-            if keyword in text_lower and not state.room_type:
-                # 提取包含关键词的词组
-                words = text.split()
-                for word in words:
-                    if keyword in word.lower():
-                        state.room_type = word
-                        break
-                if not state.room_type:
-                    state.room_type = f"{keyword}房"
-
-        # 酒店名称 - 如果还没找到，尝试提取
-        if not state.hotel_name:
-            # 简单实现：去掉日期和房型关键词，剩下的作为酒店名称
-            cleaned = text
-            for date in dates:
-                cleaned = cleaned.replace(date, '')
-            for keyword in room_type_keywords:
-                cleaned = cleaned.replace(keyword, '')
-            cleaned = cleaned.strip()
-            if cleaned:
-                state.hotel_name = cleaned
-
-        # 更新到下一个需要信息的步骤
-        self._advance_to_missing_step(state)
 
     def _advance_to_missing_step(self, state: QueryState):
         """根据缺失信息前进到下一步骤"""
@@ -339,6 +284,8 @@ class HotelPriceAgent:
         return "请补充完整查询信息。"
 
     async def close(self):
-        """关闭工具"""
+        """关闭所有工具和服务"""
         await self.search_hotel_tool.close()
         await self.query_price_tool.close()
+        await self.parse_image_tool.close()
+        await self.extraction_service.close()
