@@ -48,7 +48,7 @@ class TestIntegration(unittest.TestCase):
     def setUp(self):
         """每个测试方法初始化"""
         # 初始化各个服务
-        self.order_service = OrderService()
+        self.order_service = OrderService(self.db_path)
         self.price_service = PriceService()
         self.hotel_executor = HotelExecutor(mock=True)
 

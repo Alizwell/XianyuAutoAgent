@@ -17,25 +17,25 @@ from services.order_service import (
 )
 
 
-def get_test_db_path():
-    """获取测试数据库路径"""
-    return os.path.join(os.path.dirname(__file__), "test_xianyu.db")
-
-
-def clean_test_db():
-    """清理测试数据库"""
-    db_path = get_test_db_path()
-    if os.path.exists(db_path):
-        os.remove(db_path)
+import tempfile
 
 
 @pytest.fixture(scope="function")
 def order_service():
-    """创建订单服务实例（每个测试函数都会清理并重新创建）"""
-    clean_test_db()
-    service = OrderService(get_test_db_path())
-    yield service
-    clean_test_db()
+    """创建订单服务实例（每个测试函数都会创建新的临时数据库）"""
+    temp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    temp_db.close()
+    db_path = temp_db.name
+
+    try:
+        service = OrderService(db_path)
+        yield service
+    finally:
+        if os.path.exists(db_path):
+            try:
+                os.remove(db_path)
+            except Exception:
+                pass
 
 
 class TestOrderService:

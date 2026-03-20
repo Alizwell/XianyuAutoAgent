@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS orders (
     confirmed_at DATETIME,                 -- 确认时间
     paid_at DATETIME,                      -- 付款时间
     booked_at DATETIME,                    -- 预订成功时间
+    refunded_at DATETIME,                  -- 退款时间
     completed_at DATETIME,                 -- 完成时间
 
     -- 扩展字段

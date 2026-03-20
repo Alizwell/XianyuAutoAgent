@@ -244,7 +244,10 @@ class Database:
 
         try:
             result = self.execute(sql, params)
-            if result is not None:
+            # For INSERT statements, we don't get a result, but we should still return the last insert id
+            if sql.strip().upper().startswith("INSERT"):
+                return self.get_last_insert_id()
+            if result is None:
                 return -1
             return self.get_last_insert_id()
         except Exception as e:
@@ -523,8 +526,11 @@ _db_instance = None
 
 
 def get_db_instance(db_path="data/xianyu.db"):
-    """获取全局数据库实例"""
+    """获取数据库实例（根据路径返回不同的实例）"""
     global _db_instance
     if _db_instance is None:
+        _db_instance = Database(db_path)
+    elif _db_instance.db_path != db_path:
+        # 如果路径不同，创建新实例
         _db_instance = Database(db_path)
     return _db_instance

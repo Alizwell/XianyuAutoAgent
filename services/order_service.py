@@ -60,10 +60,13 @@ class OrderService:
         Args:
             db_path: 数据库文件路径，None则使用默认路径
         """
+        from loguru import logger
         if db_path:
             self.db = get_db_instance(db_path)
+            logger.info(f"OrderService initialized with DB path: {db_path}")
         else:
             self.db = get_db_instance()
+            logger.info(f"OrderService initialized with default DB path: {self.db.db_path}")
 
     def _generate_order_id(self) -> str:
         """生成唯一订单ID"""
@@ -119,6 +122,9 @@ class OrderService:
         order_id = self._generate_order_id()
 
         # 准备订单数据
+        metadata_json = json.dumps(order_data.get("metadata")) if order_data.get("metadata") else None
+        logger.info(f"Preparing metadata: {order_data.get('metadata')} -> {metadata_json}, type: {type(metadata_json) if metadata_json else None}")
+
         data = {
             "order_id": order_id,
             "chat_id": order_data["chat_id"],
@@ -133,24 +139,31 @@ class OrderService:
             "final_price": order_data.get("final_price"),
             "currency": order_data.get("currency", "CNY"),
             "status": OrderStatus.PENDING,
-            "metadata": json.dumps(order_data.get("metadata")) if order_data.get("metadata") else None,
+            "metadata": metadata_json,
             "remark": order_data.get("remark")
         }
 
         # 创建订单
         try:
             insert_id = self.db.create_order(data)
+            logger.info(f"Insert order returned: {insert_id}")
             if insert_id is None or insert_id < 0:
                 raise OrderError("Failed to create order")
 
             # 获取创建的订单
             order = self.db.get_order_by_id(order_id)
+            logger.info(f"Retrieved order from DB: {order}")
+            logger.info(f"Retrieved order metadata: {order.get('metadata')}, type: {type(order.get('metadata')) if order else None}")
             if not order:
                 raise OrderError("Failed to retrieve created order")
 
             # 解析metadata
             if order.get("metadata"):
                 order["metadata"] = json.loads(order["metadata"])
+                # 再次解析，因为可能被双重编码了
+                if isinstance(order["metadata"], str):
+                    order["metadata"] = json.loads(order["metadata"])
+                logger.info(f"Parsed metadata: {order['metadata']}, type: {type(order['metadata'])}")
 
             return order
         except Exception as e:
