@@ -76,7 +76,7 @@ class XianyuReplyBot:
         user_assistant_msgs = [msg for msg in context if msg['role'] in ['user', 'assistant']]
         return "\n".join([f"{msg['role']}: {msg['content']}" for msg in user_assistant_msgs])
 
-    def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict], image_url: Optional[str] = None, image_base64: Optional[str] = None) -> str:
+    async def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict], image_url: Optional[str] = None, image_base64: Optional[str] = None) -> str:
         """生成回复主流程"""
         # 记录用户消息
         # logger.debug(f'用户所发消息: {user_msg}')
@@ -96,13 +96,12 @@ class XianyuReplyBot:
             # 使用会话ID（从上下文中获取，或者使用第一个消息ID）
             session_id = self._get_session_id(context)
 
-            import asyncio
-            result = asyncio.run(self.hotel_price_agent.process_message(
+            result = await self.hotel_price_agent.process_message(
                 session_id=session_id,
                 user_message=user_msg,
                 image_url=image_url,
                 image_base64=image_base64
-            ))
+            )
 
             reply = result['reply']
             logger.info(f'酒店查询完成: 状态={result["state"]["current_step"]}')
