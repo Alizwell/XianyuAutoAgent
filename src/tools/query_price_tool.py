@@ -93,6 +93,7 @@ class QueryPriceTool(BaseTool):
                     # 跳过解析失败的房间
                     continue
 
+            logger.info(f"查询房间价格结果: {rooms}")
             return ToolResult.success_result(
                 data={
                     'hotel_id': room_info.get('hotel_id'),

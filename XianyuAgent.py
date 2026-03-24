@@ -112,10 +112,9 @@ class XianyuReplyBot:
             ),
             # 酒店价格查询Agent：配置LangChain原生tools + 自定义handler
             'hotel_query': AgentConfig(
-                chain=None,  # 使用 handler 而非 chain
+                chain=self._build_chain(self.hotel_query_prompt, temperature=0.4),
                 tools=hotel_tools,
-                handler=hotel_agent,
-                system_prompt="",
+                system_prompt=self.hotel_query_prompt,
                 temperature=0.4,
             ),
         }
@@ -161,6 +160,7 @@ class XianyuReplyBot:
             self.price_prompt = load_prompt_content("price_prompt")
             self.tech_prompt = load_prompt_content("tech_prompt")
             self.default_prompt = load_prompt_content("default_prompt")
+            self.hotel_query_prompt = load_prompt_content("hotel_query_prompt")
             logger.info("成功加载所有提示词")
         except Exception as e:
             logger.error(f"加载提示词时出错: {e}")

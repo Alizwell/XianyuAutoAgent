@@ -55,6 +55,7 @@ class SearchHotelTool(BaseTool):
             city_name=city_name,
             limit=limit,
         )
+        logger.info(f"搜索酒店结果: {result}")
         return result.to_json()
 
     async def execute(self, keyword: str, check_in_date: str, check_out_date: str,
