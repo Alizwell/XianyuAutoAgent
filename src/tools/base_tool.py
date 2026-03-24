@@ -1,13 +1,19 @@
-"""工具基类"""
+"""工具基类与通用类型 —— LangChain 集成"""
 
-from abc import ABC, abstractmethod
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 
 @dataclass
 class ToolResult:
-    """工具执行结果"""
+    """
+    工具执行结果
+
+    供内部 Agent（如 HotelPriceAgent）直接调用 execute() 时使用，
+    提供结构化的成功/失败信息。
+    LangChain 的 _arun 入口会调用 to_json() 将结果序列化为字符串返回。
+    """
     success: bool
     data: Optional[Any] = None
     error: Optional[str] = None
@@ -23,48 +29,12 @@ class ToolResult:
         """创建错误结果"""
         return cls(success=False, error=error, metadata=metadata)
 
-
-class BaseTool(ABC):
-    """工具基类"""
-
-    name: str = ""
-    description: str = ""
-
-    @abstractmethod
-    async def execute(self, **kwargs) -> ToolResult:
+    def to_json(self) -> str:
         """
-        执行工具
-
-        Args:
-            **kwargs: 执行参数
-
-        Returns:
-            ToolResult: 执行结果
+        序列化为JSON字符串。
+        成功时返回 data 的JSON，失败时返回包含 error 的JSON。
+        供 LangChain BaseTool._arun 返回值使用。
         """
-        pass
-
-    def validate_params(self, required_params: list, provided_params: dict, require_at_least_one: bool = False) -> Optional[str]:
-        """
-        验证参数
-
-        Args:
-            required_params: 必需参数列表
-            provided_params: 提供的参数
-            require_at_least_one: 是否至少需要提供一个参数（而不是全部）
-
-        Returns:
-            错误信息，如果验证通过返回None
-        """
-        if require_at_least_one:
-            # 检查是否至少提供了一个参数
-            has_valid_param = any(
-                provided_params.get(p) is not None for p in required_params
-            )
-            if not has_valid_param:
-                return f"At least one of the following parameters is required: {', '.join(required_params)}"
-        else:
-            # 检查所有参数是否都提供了
-            missing = [p for p in required_params if p not in provided_params or provided_params[p] is None]
-            if missing:
-                return f"Missing required parameters: {', '.join(missing)}"
-        return None
+        if self.success:
+            return json.dumps(self.data, ensure_ascii=False)
+        return json.dumps({"error": self.error}, ensure_ascii=False)

@@ -4,7 +4,6 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from src.models import QueryState, QueryStep
 from src.tools import (
-    BaseTool,
     ToolResult,
     SearchHotelTool,
     QueryPriceTool,

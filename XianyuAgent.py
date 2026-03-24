@@ -1,49 +1,154 @@
-import re
-from typing import List, Dict, Optional
-import os
-from openai import OpenAI
-from loguru import logger
-from src.agent.hotel_price_agent import HotelPriceAgent
+"""
+闲鱼自动回复Agent系统 —— 基于LangChain重构
 
+使用 LangChain 统一管理各领域 Agent 的提示词、LLM调用、工具和意图路由。
+每个 Agent 通过 AgentConfig 配置，支持可选绑定 tools。
+工具类已原生集成 LangChain BaseTool，无需额外包装。
+"""
+
+import re
+import os
+from typing import List, Dict, Optional, Any
+from dataclasses import dataclass, field
+
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from loguru import logger
+
+from src.agent.hotel_price_agent import HotelPriceAgent
+from src.tools import SearchHotelTool, QueryPriceTool, ParseImageTool
+
+
+# ============================================================
+# Agent 配置数据类
+# ============================================================
+
+@dataclass
+class AgentConfig:
+    """
+    Agent 配置项
+
+    Attributes:
+        chain: LangChain Runnable Chain（prompt | llm | parser）
+        tools: 该Agent可使用的工具列表（LangChain BaseTool 子类）
+        handler: 自定义处理器（用于需要特殊处理逻辑的Agent，如hotel_query）
+        system_prompt: 系统提示词原文
+        temperature: LLM温度参数
+    """
+    chain: Any = None
+    tools: List[Any] = field(default_factory=list)
+    handler: Any = None
+    system_prompt: str = ""
+    temperature: float = 0.4
+
+
+# ============================================================
+# 主Bot类
+# ============================================================
 
 class XianyuReplyBot:
+    """闲鱼自动回复Bot（LangChain版）"""
+
     def __init__(self):
-        # 初始化OpenAI客户端
-        self.client = OpenAI(
+        # 初始化LangChain LLM
+        self.llm = ChatOpenAI(
             api_key=os.getenv("API_KEY"),
             base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            model=os.getenv("MODEL_NAME", "qwen-max"),
+            max_tokens=500,
+            top_p=0.8,
         )
         self._init_system_prompts()
         self._init_agents()
-        self.router = IntentRouter(self.agents['classify'])
+        self.router = IntentRouter(self.agents['classify'].chain, self.llm)
         self.last_intent = None  # 记录最后一次意图
-        # 初始化酒店价格查询Agent
-        self.hotel_price_agent = HotelPriceAgent()
-
 
     def _init_agents(self):
-        """初始化各领域Agent"""
-        from dialog.dialog_agent import DialogAgent
-        self.agents = {
-            'classify':ClassifyAgent(self.client, self.classify_prompt, self._safe_filter),
-            'price': PriceAgent(self.client, self.price_prompt, self._safe_filter),
-            'tech': TechAgent(self.client, self.tech_prompt, self._safe_filter),
-            'default': DefaultAgent(self.client, self.default_prompt, self._safe_filter),
-            'hotel_query': None,  # 单独初始化在__init__
+        """
+        初始化各领域Agent，统一存储在 self.agents 字典中。
+        每个Agent是一个 AgentConfig 实例，包含 chain、tools、handler 等配置。
+        工具类已原生集成 LangChain BaseTool，直接实例化即可。
+        """
+        # 初始化 LangChain 原生工具实例
+        search_hotel_tool = SearchHotelTool()
+        query_price_tool = QueryPriceTool()
+        parse_image_tool = ParseImageTool()
+
+        # 酒店相关工具列表
+        hotel_tools = [search_hotel_tool, query_price_tool, parse_image_tool]
+
+        # 初始化 HotelPriceAgent（复用工具实例，避免重复创建适配器）
+        hotel_agent = HotelPriceAgent(
+            search_hotel_tool=search_hotel_tool,
+            query_price_tool=query_price_tool,
+            parse_image_tool=parse_image_tool,
+        )
+
+        self.agents: Dict[str, AgentConfig] = {
+            # 分类Agent：用于意图识别兜底
+            'classify': AgentConfig(
+                chain=self._build_chain(self.classify_prompt, temperature=0.4),
+                system_prompt=self.classify_prompt,
+                temperature=0.4,
+            ),
+            # 议价Agent
+            'price': AgentConfig(
+                chain=self._build_chain(self.price_prompt, temperature=0.4),
+                system_prompt=self.price_prompt,
+                temperature=0.4,
+            ),
+            # 技术咨询Agent
+            'tech': AgentConfig(
+                chain=self._build_chain(self.tech_prompt, temperature=0.4),
+                system_prompt=self.tech_prompt,
+                temperature=0.4,
+            ),
+            # 默认Agent
+            'default': AgentConfig(
+                chain=self._build_chain(self.default_prompt, temperature=0.7),
+                system_prompt=self.default_prompt,
+                temperature=0.7,
+            ),
+            # 酒店价格查询Agent：配置LangChain原生tools + 自定义handler
+            'hotel_query': AgentConfig(
+                chain=None,  # 使用 handler 而非 chain
+                tools=hotel_tools,
+                handler=hotel_agent,
+                system_prompt="",
+                temperature=0.4,
+            ),
         }
+
+    def _build_chain(self, system_prompt: str, temperature: float = 0.4):
+        """
+        构建一个 LangChain Chain（prompt | llm | parser）
+
+        Args:
+            system_prompt: 系统提示词模板
+            temperature: LLM温度参数
+
+        Returns:
+            可执行的 Runnable Chain
+        """
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "【商品信息】{item_desc}\n【你与客户对话历史】{context}\n{system_prompt}"),
+            ("human", "{user_msg}"),
+        ])
+
+        llm_with_temp = self.llm.bind(temperature=temperature)
+        return prompt | llm_with_temp | StrOutputParser()
 
     def _init_system_prompts(self):
         """初始化各Agent专用提示词，优先加载用户自定义文件，否则使用Example默认文件"""
         prompt_dir = "prompts"
-        
+
         def load_prompt_content(name: str) -> str:
             """尝试加载提示词文件"""
-            # 优先尝试加载 target.txt
             target_path = os.path.join(prompt_dir, f"{name}.txt")
             if os.path.exists(target_path):
                 file_path = target_path
             else:
-                # 尝试默认提示词 target_example.txt
                 file_path = os.path.join(prompt_dir, f"{name}_example.txt")
 
             with open(file_path, "r", encoding="utf-8") as f:
@@ -52,15 +157,10 @@ class XianyuReplyBot:
                 return content
 
         try:
-            # 加载分类提示词
             self.classify_prompt = load_prompt_content("classify_prompt")
-            # 加载价格提示词
             self.price_prompt = load_prompt_content("price_prompt")
-            # 加载技术提示词
             self.tech_prompt = load_prompt_content("tech_prompt")
-            # 加载默认提示词
             self.default_prompt = load_prompt_content("default_prompt")
-                
             logger.info("成功加载所有提示词")
         except Exception as e:
             logger.error(f"加载提示词时出错: {e}")
@@ -73,95 +173,102 @@ class XianyuReplyBot:
 
     def format_history(self, context: List[Dict]) -> str:
         """格式化对话历史，返回完整的对话记录"""
-        # 过滤掉系统消息，只保留用户和助手的对话
         user_assistant_msgs = [msg for msg in context if msg['role'] in ['user', 'assistant']]
         return "\n".join([f"{msg['role']}: {msg['content']}" for msg in user_assistant_msgs])
 
-    async def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict], image_url: Optional[str] = None, image_base64: Optional[str] = None) -> str:
-        """生成回复主流程"""
-        # 记录用户消息
-        # logger.debug(f'用户所发消息: {user_msg}')
-
+    async def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict],
+                             image_url: Optional[str] = None, image_base64: Optional[str] = None) -> str:
+        """
+        生成回复主流程（接口保持不变，兼容 main.py 调用）
+        """
         formatted_context = self.format_history(context)
-        # logger.debug(f'对话历史: {formatted_context}')
 
         # 1. 路由决策
         detected_intent = self.router.detect(user_msg, item_desc, formatted_context)
 
-
-        # 2. 特殊处理：酒店价格查询
-        if detected_intent == 'hotel_query':
-            logger.info(f'意图识别完成: hotel_query')
-            self.last_intent = 'hotel_query'
-
-            # 使用会话ID（从上下文中获取，或者使用第一个消息ID）
-            session_id = self._get_session_id(context)
-
-            result = await self.hotel_price_agent.process_message(
-                session_id=session_id,
-                user_message=user_msg,
-                image_url=image_url,
-                image_base64=image_base64
-            )
-
-            reply = result['reply']
-            logger.info(f'酒店查询完成: 状态={result["state"]["current_step"]}')
-
-            return self._safe_filter(reply)
-
-        # 3. 获取对应Agent
-
-        internal_intents = {'classify'}  # 定义不对外开放的Agent
-
+        # 2. 无需回复
         if detected_intent == 'no_reply':
-            # 无需回复的情况
-            logger.info(f'意图识别完成: no_reply - 无需回复')
+            logger.info('意图识别完成: no_reply - 无需回复')
             self.last_intent = 'no_reply'
-            return "-"  # 返回特殊标记，表示无需回复
-        elif detected_intent in self.agents and detected_intent not in internal_intents:
-            agent = self.agents[detected_intent]
-            logger.info(f'意图识别完成: {detected_intent}')
-            self.last_intent = detected_intent  # 保存当前意图
-        else:
-            agent = self.agents['default']
-            logger.info(f'意图识别完成: default')
-            self.last_intent = 'default'  # 保存当前意图
+            return "-"
 
-        # 4. 获取议价次数
+        # 3. 获取对应 AgentConfig
+        internal_intents = {'classify'}
+        if detected_intent in self.agents and detected_intent not in internal_intents:
+            agent_config = self.agents[detected_intent]
+            logger.info(f'意图识别完成: {detected_intent}')
+            self.last_intent = detected_intent
+        else:
+            agent_config = self.agents['default']
+            logger.info('意图识别完成: default')
+            self.last_intent = 'default'
+
+        # 4. 如果Agent配置了自定义handler，优先使用handler处理
+        if agent_config.handler is not None:
+            return await self._handle_with_handler(agent_config, user_msg, context, image_url, image_base64)
+
+        # 5. 使用标准Chain处理
+        return self._handle_with_chain(agent_config, detected_intent, user_msg, item_desc, formatted_context, context)
+
+    async def _handle_with_handler(self, agent_config: AgentConfig, user_msg: str,
+                                   context: List[Dict], image_url: Optional[str],
+                                   image_base64: Optional[str]) -> str:
+        """使用自定义handler处理消息（如酒店价格查询Agent）"""
+        session_id = self._get_session_id(context)
+        result = await agent_config.handler.process_message(
+            session_id=session_id,
+            user_message=user_msg,
+            image_url=image_url,
+            image_base64=image_base64,
+        )
+
+        reply = result['reply']
+        logger.info(f'Agent处理完成: 状态={result["state"]["current_step"]}')
+
+        # 记录该Agent可用的工具信息
+        if agent_config.tools:
+            logger.debug(f'该Agent配置了 {len(agent_config.tools)} 个工具: '
+                        f'{[t.name for t in agent_config.tools]}')
+
+        return self._safe_filter(reply)
+
+    def _handle_with_chain(self, agent_config: AgentConfig, intent: str,
+                           user_msg: str, item_desc: str, formatted_context: str,
+                           context: List[Dict]) -> str:
+        """使用LangChain Chain处理消息"""
         bargain_count = self._extract_bargain_count(context)
         logger.info(f'议价次数: {bargain_count}')
 
-        # 5. 生成回复
-        return agent.generate(
-            user_msg=user_msg,
-            item_desc=item_desc,
-            context=formatted_context,
-            bargain_count=bargain_count
-        )
+        chain = agent_config.chain
+
+        chain_input = {
+            "user_msg": user_msg,
+            "item_desc": item_desc,
+            "context": formatted_context,
+            "system_prompt": agent_config.system_prompt,
+        }
+
+        # 对议价Agent追加议价轮次信息并动态调整温度
+        if intent == 'price':
+            chain_input["system_prompt"] += f"\n▲当前议价轮次：{bargain_count}"
+            dynamic_temp = min(0.3 + bargain_count * 0.15, 0.9)
+            chain = self._build_chain(chain_input["system_prompt"], temperature=dynamic_temp)
+
+        response = chain.invoke(chain_input)
+        return self._safe_filter(response)
 
     def _get_session_id(self, context: List[Dict]) -> str:
         """从上下文中获取会话ID"""
-        # 简单实现：使用第一个消息的哈希作为会话ID
         if context:
             first_msg = context[0].get('content', '')
             return str(hash(first_msg))[:16]
         return 'default'
-    
+
     def _extract_bargain_count(self, context: List[Dict]) -> int:
-        """
-        从上下文中提取议价次数信息
-        
-        Args:
-            context: 对话历史
-            
-        Returns:
-            int: 议价次数，如果没有找到则返回0
-        """
-        # 查找系统消息中的议价次数信息
+        """从上下文中提取议价次数信息"""
         for msg in context:
             if msg['role'] == 'system' and '议价次数' in msg['content']:
                 try:
-                    # 提取议价次数
                     match = re.search(r'议价次数[:：]\s*(\d+)', msg['content'])
                     if match:
                         return int(match.group(1))
@@ -174,25 +281,49 @@ class XianyuReplyBot:
         logger.info("正在重新加载提示词...")
         self._init_system_prompts()
         self._init_agents()
+        self.router = IntentRouter(self.agents['classify'].chain, self.llm)
         logger.info("提示词重新加载完成")
 
+    def get_agent_tools(self, intent: str) -> list:
+        """
+        获取指定Agent的工具列表
+
+        Args:
+            intent: Agent名称/意图名
+
+        Returns:
+            LangChain BaseTool 子类实例列表
+        """
+        if intent in self.agents:
+            return self.agents[intent].tools
+        return []
+
+
+# ============================================================
+# 意图路由器
+# ============================================================
 
 class IntentRouter:
-    """意图路由决策器"""
+    """
+    意图路由决策器
 
-    def __init__(self, classify_agent):
+    三级路由策略：
+    1. 规则匹配（关键词 + 正则）
+    2. 图片消息特殊处理
+    3. LangChain Chain 大模型兜底分类
+    """
+
+    def __init__(self, classify_chain, llm):
         self.rules = {
-            'tech': {  # 技术类优先判定
+            'tech': {
                 'keywords': ['参数', '规格', '型号', '连接', '对比'],
-                'patterns': [
-                    r'和.+比'
-                ]
+                'patterns': [r'和.+比']
             },
             'price': {
                 'keywords': ['便宜', '价', '砍价', '少点'],
                 'patterns': [r'\d+元', r'能少\d+']
             },
-            'hotel_query': {  # 酒店价格查询
+            'hotel_query': {
                 'keywords': ['酒店', '代订', '价格', '查询', '哪天', '日期', '房型', '入住'],
                 'patterns': [
                     r'.*酒店.*价格',
@@ -202,11 +333,10 @@ class IntentRouter:
                 ]
             }
         }
-        self.classify_agent = classify_agent
+        self.classify_chain = classify_chain
 
-    def detect(self, user_msg: str, item_desc, context) -> str:
+    def detect(self, user_msg: str, item_desc: str, context: str) -> str:
         """三级路由策略（技术优先）"""
-        # 如果用户发送图片（占位符[图片]），默认按酒店价格查询处理
         if '[图片]' in user_msg:
             logger.debug("用户发送图片，默认按酒店价格查询处理")
             return 'hotel_query'
@@ -233,161 +363,19 @@ class IntentRouter:
                 return 'hotel_query'
 
         # 4. 价格类检查
-        for intent in ['price']:
-            if any(kw in text_clean for kw in self.rules[intent]['keywords']):
-                return intent
+        if any(kw in text_clean for kw in self.rules['price']['keywords']):
+            return 'price'
 
-            for pattern in self.rules[intent]['patterns']:
-                if re.search(pattern, text_clean):
-                    return intent
+        for pattern in self.rules['price']['patterns']:
+            if re.search(pattern, text_clean):
+                return 'price'
 
         # 5. 大模型兜底
         logger.debug("使用大模型进行意图分类")
-        return self.classify_agent.generate(
-            user_msg=user_msg,
-            item_desc=item_desc,
-            context=context
-        )
-
-
-class HotelAgent:
-    """酒店预订Agent"""
-
-    def __init__(self, client: Optional[OpenAI] = None):
-        """
-        初始化酒店Agent
-        Args:
-            client: OpenAI客户端（可选）
-        """
-        self.client = client
-        self.dialog_agents = {}
-        logger.info("HotelAgent initialized")
-
-    def generate(self, user_msg: str, item_desc: str, context: str, **kwargs) -> str:
-        """
-        处理酒店相关意图
-        Args:
-            user_msg: 用户消息
-            item_desc: 商品描述
-            context: 对话历史
-            **kwargs: 其他参数
-        Returns:
-            回复内容
-        """
-        # 获取或创建DialogAgent
-        chat_id = "default_chat"
-        user_id = "default_user"
-
-        if chat_id not in self.dialog_agents:
-            self.dialog_agents[chat_id] = DialogAgent(chat_id, user_id)
-            logger.debug(f"Created new DialogAgent for chat_id: {chat_id}")
-
-        dialog_agent = self.dialog_agents[chat_id]
-
-        # 处理用户消息
-        try:
-            reply = dialog_agent.process_message(user_msg)
-            logger.debug(f"DialogAgent replied: {reply}")
-            return reply
-        except Exception as e:
-            logger.error(f"Error processing message with DialogAgent: {e}")
-            return "很抱歉，处理您的请求时发生了错误，请稍后再试。"
-
-
-class BaseAgent:
-    """Agent基类"""
-
-    def __init__(self, client, system_prompt, safety_filter):
-        self.client = client
-        self.system_prompt = system_prompt
-        self.safety_filter = safety_filter
-
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0) -> str:
-        """生成回复模板方法"""
-        messages = self._build_messages(user_msg, item_desc, context)
-        response = self._call_llm(messages)
-        return self.safety_filter(response)
-
-    def _build_messages(self, user_msg: str, item_desc: str, context: str) -> List[Dict]:
-        """构建消息链"""
-        return [
-            {"role": "system", "content": f"【商品信息】{item_desc}\n【你与客户对话历史】{context}\n{self.system_prompt}"},
-            {"role": "user", "content": user_msg}
-        ]
-
-    def _call_llm(self, messages: List[Dict], temperature: float = 0.4) -> str:
-        """调用大模型"""
-        response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
-            messages=messages,
-            temperature=temperature,
-            max_tokens=500,
-            top_p=0.8
-        )
-        return response.choices[0].message.content
-
-
-class PriceAgent(BaseAgent):
-    """议价处理Agent"""
-
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0) -> str:
-        """重写生成逻辑"""
-        dynamic_temp = self._calc_temperature(bargain_count)
-        messages = self._build_messages(user_msg, item_desc, context)
-        messages[0]['content'] += f"\n▲当前议价轮次：{bargain_count}"
-
-        response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
-            messages=messages,
-            temperature=dynamic_temp,
-            max_tokens=500,
-            top_p=0.8
-        )
-        return self.safety_filter(response.choices[0].message.content)
-
-    def _calc_temperature(self, bargain_count: int) -> float:
-        """动态温度策略"""
-        return min(0.3 + bargain_count * 0.15, 0.9)
-
-
-class TechAgent(BaseAgent):
-    """技术咨询Agent"""
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0) -> str:
-        """重写生成逻辑"""
-        messages = self._build_messages(user_msg, item_desc, context)
-        # messages[0]['content'] += "\n▲知识库：\n" + self._fetch_tech_specs()
-
-        response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
-            messages=messages,
-            temperature=0.4,
-            max_tokens=500,
-            top_p=0.8,
-            extra_body={
-                "enable_search": True,
-            }
-        )
-
-        return self.safety_filter(response.choices[0].message.content)
-
-
-    # def _fetch_tech_specs(self) -> str:
-    #     """模拟获取技术参数（可连接数据库）"""
-    #     return "功率：200W@8Ω\n接口：XLR+RCA\n频响：20Hz-20kHz"
-
-
-class ClassifyAgent(BaseAgent):
-    """意图识别Agent"""
-
-    def generate(self, **args) -> str:
-        response = super().generate(**args)
-        return response
-
-
-class DefaultAgent(BaseAgent):
-    """默认处理Agent"""
-
-    def _call_llm(self, messages: List[Dict], *args) -> str:
-        """限制默认回复长度"""
-        response = super()._call_llm(messages, temperature=0.7)
-        return response
+        result = self.classify_chain.invoke({
+            "user_msg": user_msg,
+            "item_desc": item_desc,
+            "context": context,
+            "system_prompt": "",
+        })
+        return result.strip().lower()
