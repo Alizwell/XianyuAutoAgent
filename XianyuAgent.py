@@ -201,8 +201,6 @@ class IntentRouter:
                     r'.*什么房型'
                 ]
             }
-                ]
-            }
         }
         self.classify_agent = classify_agent
 
@@ -224,13 +222,15 @@ class IntentRouter:
             if re.search(pattern, text_clean):
                 return 'tech'
 
-        # 3. 酒店类检查
-        if any(kw in text_clean for kw in self.rules['hotel']['keywords']):
-            return 'hotel'
+        # 3. 酒店查询检查
+        if any(kw in text_clean for kw in self.rules['hotel_query']['keywords']):
+            logger.debug(f"酒店查询关键词匹配: {[kw for kw in self.rules['hotel_query']['keywords'] if kw in text_clean]}")
+            return 'hotel_query'
 
-        for pattern in self.rules['hotel']['patterns']:
+        for pattern in self.rules['hotel_query']['patterns']:
             if re.search(pattern, text_clean):
-                return 'hotel'
+                logger.debug(f"酒店查询正则匹配: {pattern}")
+                return 'hotel_query'
 
         # 4. 价格类检查
         for intent in ['price']:
@@ -239,17 +239,6 @@ class IntentRouter:
 
             for pattern in self.rules[intent]['patterns']:
                 if re.search(pattern, text_clean):
-                    return intent
-
-        # 4. 酒店查询检查
-        for intent in ['hotel_query']:
-            if any(kw in text_clean for kw in self.rules[intent]['keywords']):
-                logger.debug(f"酒店查询关键词匹配: {[kw for kw in self.rules[intent]['keywords'] if kw in text_clean]}")
-                return intent
-
-            for pattern in self.rules[intent]['patterns']:
-                if re.search(pattern, text_clean):
-                    logger.debug(f"酒店查询正则匹配: {pattern}")
                     return intent
 
         # 5. 大模型兜底
