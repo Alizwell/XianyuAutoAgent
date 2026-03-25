@@ -1,44 +1,115 @@
-"""酒店价格查询Agent"""
+"""
+酒店价格查询Agent —— 基于LangChain重构
 
+使用 LangChain AgentExecutor + Tool Calling 替代手写状态机：
+- LLM 自动从对话中提取酒店名称、日期、房型等信息
+- LLM 自主决定何时调用搜索/查价工具
+- LLM 自动生成追问和格式化回复
+- 会话历史在内存中按 session_id 管理
+"""
+
+import os
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timedelta
-from src.models import QueryState, QueryStep
-from src.tools import (
-    ToolResult,
-    SearchHotelTool,
-    QueryPriceTool,
-    ParseImageTool
-)
-from src.agent.state_manager import StateManager
-from src.services import LLMExtractionService, ExtractedInfo
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+from loguru import logger
+
+from src.tools import SearchHotelTool, QueryPriceTool, ParseImageTool
 
 
 class HotelPriceAgent:
-    """酒店价格查询Agent"""
+    """
+    酒店价格查询Agent（LangChain版）
+
+    核心改动：
+    - 移除 StateManager（Redis）和 QueryState/QueryStep 状态机
+    - 移除 LLMExtractionService（LLM 在 Agent 流程中自然完成信息提取）
+    - 使用 LangChain Tool Calling Agent 自主调度工具
+    - 会话历史按 session_id 在内存中管理
+    """
 
     def __init__(
         self,
-        state_manager: Optional[StateManager] = None,
         search_hotel_tool: Optional[SearchHotelTool] = None,
         query_price_tool: Optional[QueryPriceTool] = None,
         parse_image_tool: Optional[ParseImageTool] = None,
-        extraction_service: Optional[LLMExtractionService] = None,
     ):
         """
         初始化Agent
 
         Args:
-            state_manager: 状态管理器
-            search_hotel_tool: 搜索酒店工具
-            query_price_tool: 查询价格工具
-            parse_image_tool: 解析图片工具
-            extraction_service: 统一LLM信息提取服务
+            search_hotel_tool: 搜索酒店工具（LangChain BaseTool）
+            query_price_tool: 查询价格工具（LangChain BaseTool）
+            parse_image_tool: 解析图片工具（LangChain BaseTool）
         """
-        self.state_manager = state_manager or StateManager()
+        # 初始化工具（支持外部注入，也可自动创建）
         self.search_hotel_tool = search_hotel_tool or SearchHotelTool()
         self.query_price_tool = query_price_tool or QueryPriceTool()
         self.parse_image_tool = parse_image_tool or ParseImageTool()
-        self.extraction_service = extraction_service or LLMExtractionService()
+        self.tools = [self.search_hotel_tool, self.query_price_tool, self.parse_image_tool]
+
+        # 会话历史（内存管理，key=session_id）
+        self.session_histories: Dict[str, List] = {}
+
+        # 加载系统提示词
+        self.system_prompt = self._load_prompt()
+
+        # 初始化 LLM
+        self.llm = ChatOpenAI(
+            api_key=os.getenv("API_KEY"),
+            base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            model=os.getenv("MODEL_NAME", "qwen-max"),
+            max_tokens=800,
+            temperature=0.1,
+        )
+
+        # 构建 LangChain Agent
+        self.agent_executor = self._build_agent()
+
+    def _load_prompt(self) -> str:
+        """加载酒店查询提示词（优先 .txt，fallback 到 _example.txt）"""
+        prompt_dir = "prompts"
+        target_path = os.path.join(prompt_dir, "hotel_query_prompt.txt")
+        if os.path.exists(target_path):
+            file_path = target_path
+        else:
+            file_path = os.path.join(prompt_dir, "hotel_query_prompt_example.txt")
+
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                logger.debug(f"已加载酒店查询提示词, 路径: {file_path}, 长度: {len(content)} 字符")
+                return content
+
+        logger.warning("未找到酒店查询提示词文件, 使用默认提示词")
+        return "你是酒店价格查询助手，帮助用户查询酒店房间价格。"
+
+    def _build_agent(self) -> AgentExecutor:
+        """
+        构建 LangChain Tool Calling Agent
+
+        使用 ChatPromptTemplate + MessagesPlaceholder 管理多轮对话，
+        LLM 通过 tool calling 自主调度搜索和查价工具。
+        """
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", self.system_prompt),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
+
+        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+
+        return AgentExecutor(
+            agent=agent,
+            tools=self.tools,
+            verbose=True,
+            handle_parsing_errors=True,
+            max_iterations=5,  # 防止无限循环
+        )
 
     async def process_message(
         self,
@@ -48,243 +119,104 @@ class HotelPriceAgent:
         image_base64: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        处理用户消息
+        处理用户消息（接口与原版保持一致，兼容 XianyuAgent._handle_with_handler）
 
         Args:
             session_id: 会话ID
             user_message: 用户消息
             image_url: 图片URL（如果用户发送了图片）
-            image_base64: 图片base64
+            image_base64: 图片base64编码
 
         Returns:
-            处理结果，包含回复内容和是否完成
+            包含 reply, complete, state, result 的字典
         """
-        # 获取或创建状态
-        state = self.state_manager.get_state(session_id)
-        if not state:
-            state = self.state_manager.create_state(session_id)
+        # 获取会话历史
+        chat_history = self.session_histories.get(session_id, [])
 
-        # Use unified LLM extraction for both text and image
-        extracted = await self.extraction_service.extract(
-            text=user_message,
-            image_url=image_url,
-            image_base64=image_base64
-        )
+        # 构建输入消息
+        input_msg = user_message
 
-        # Fill extracted info into state - only fill if not already set and confidence good
-        if extracted.hotel_name and not state.hotel_name:
-            state.hotel_name = extracted.hotel_name
-        if extracted.check_in_date and not state.check_in_date:
-            normalized = self._normalize_date(extracted.check_in_date)
-            state.check_in_date = normalized
-        if extracted.check_out_date and not state.check_out_date:
-            normalized = self._normalize_date(extracted.check_out_date)
-            state.check_out_date = normalized
-        if extracted.room_type and not state.room_type:
-            state.room_type = extracted.room_type
-        if extracted.price:
-            # Store price if extracted for reference
-            pass
+        # 如果有图片，先用工具解析再将结果注入消息
+        if image_url or image_base64:
+            input_msg = await self._preprocess_image(input_msg, image_url, image_base64)
 
-        # LLM already identified ambiguous fields - ambiguous fields are already null
-        # so _advance_to_missing_step will handle asking user to confirm
-        self._advance_to_missing_step(state)
-
-        # 根据当前步骤处理
-        result = await self._process_by_step(state)
-
-        # 保存状态
-        self.state_manager.save_state(state)
-
-        return {
-            'reply': result['reply'],
-            'complete': state.current_step == QueryStep.COMPLETE,
-            'state': state.to_dict(),
-            'result': result.get('result'),
-            'ambiguous_fields': extracted.ambiguous_fields,
-        }
-
-
-    def _advance_to_missing_step(self, state: QueryState):
-        """根据缺失信息前进到下一步骤"""
-        if not state.hotel_name:
-            state.update_step(QueryStep.AWAITING_HOTEL_NAME)
-        elif not state.check_in_date:
-            state.update_step(QueryStep.AWAITING_CHECKIN_DATE)
-        elif not state.check_out_date:
-            state.update_step(QueryStep.AWAITING_CHECKOUT_DATE)
-        elif not state.room_type:
-            state.update_step(QueryStep.AWAITING_ROOM_TYPE)
-        else:
-            state.update_step(QueryStep.SEARCHING)
-
-    async def _process_by_step(self, state: QueryState) -> Dict[str, Any]:
-        """根据当前步骤处理"""
-        step = state.current_step
-
-        if step == QueryStep.AWAITING_HOTEL_NAME:
-            return {'reply': "未能从图片中识别出有效的酒店信息，请提供您要预订的酒店名称、入住日期、离店日期和房型信息。例如：汉庭厦门中山路轮渡酒店 2026-03-22 2026-03-23 高级大床房"}
-
-        elif step == QueryStep.AWAITING_CHECKIN_DATE:
-            return {'reply': f"好的，{state.hotel_name}。请问您的入住日期是哪天？请提供YYYY-MM-DD格式。"}
-
-        elif step == QueryStep.AWAITING_CHECKOUT_DATE:
-            if state.check_in_date:
-                return {'reply': f"入住日期是{state.check_in_date}。请问离店日期是哪天？请提供YYYY-MM-DD格式。"}
-            else:
-                return {'reply': "请问离店日期是哪天？请提供YYYY-MM-DD格式。"}
-
-        elif step == QueryStep.AWAITING_ROOM_TYPE:
-            return {'reply': "请问您需要什么房型？比如大床房、双床房等。"}
-
-        elif step == QueryStep.SEARCHING:
-            return await self._execute_search(state)
-
-        elif step == QueryStep.COMPLETE:
-            # 返回最终结果
-            return self._format_result(state)
-
-        else:
-            return {'reply': "请提供需要查询的酒店信息。"}
-
-    async def _execute_search(self, state: QueryState) -> Dict[str, Any]:
-        """执行搜索流程"""
         try:
-            # 第一步：搜索酒店
-            search_result = await self.search_hotel_tool.execute(
-                keyword=state.hotel_name,
-                check_in_date=state.check_in_date,
-                check_out_date=state.check_out_date
-            )
+            # 调用 LangChain Agent
+            result = await self.agent_executor.ainvoke({
+                "input": input_msg,
+                "chat_history": chat_history,
+            })
 
-            if not search_result.success or not search_result.data:
-                state.error_message = f"未找到酒店: {search_result.error}"
-                state.update_step(QueryStep.AWAITING_HOTEL_NAME)
-                return {'reply': f"未找到' {state.hotel_name}'，请检查酒店名称是否正确。"}
+            reply = result.get("output", "")
 
-            state.search_results = search_result.data
+            # 更新会话历史
+            chat_history.append(HumanMessage(content=user_message))
+            chat_history.append(AIMessage(content=reply))
+            self.session_histories[session_id] = chat_history
 
-            # 取第一个匹配结果
-            if len(search_result.data) > 0:
-                first_hotel = search_result.data[0]
-                state.hotel_id = first_hotel['hotel_id']
+            # 判断是否完成查询（回复中包含价格相关标志）
+            is_complete = any(marker in reply for marker in ["💰", "¥", "价格"])
 
-            # 第二步：查询价格
-            if state.hotel_id:
-                price_result = await self.query_price_tool.execute(
-                    hotel_id=state.hotel_id,
-                    check_in_date=state.check_in_date,
-                    check_out_date=state.check_out_date,
-                    room_type=state.room_type
-                )
+            logger.info(f"HotelPriceAgent 回复完成, session={session_id}, complete={is_complete}")
 
-                if not price_result.success:
-                    state.error_message = f"查询价格失败: {price_result.error}"
-                    return {'reply': f"查询价格失败: {price_result.error}"}
-
-                price_data = price_result.data
-                state.price_results = price_data.get('rooms', [])
-
-            # 完成查询
-            state.update_step(QueryStep.COMPLETE)
-            return self._format_result(state)
+            return {
+                'reply': reply,
+                'complete': is_complete,
+                'state': {
+                    'current_step': 'complete' if is_complete else 'processing',
+                    'session_id': session_id,
+                    'history_length': len(chat_history),
+                },
+                'result': None,
+            }
 
         except Exception as e:
-            state.error_message = str(e)
-            return {'reply': f"查询过程中发生错误: {str(e)}"}
-
-    def _format_result(self, state: QueryState) -> Dict[str, Any]:
-        """格式化查询结果"""
-        if not state.price_results:
-            reply = f"查询完成，但未找到{state.hotel_name}在{state.check_in_date}至{state.check_out_date}的{state.room_type}价格。"
-            return {'reply': reply, 'result': None}
-
-        room = state.price_results[0] if len(state.price_results) > 0 else None
-        if not room:
-            reply = f"查询完成，但该日期没有可用的{state.room_type}。"
-            return {'reply': reply, 'result': None}
-
-        # 简洁报价模式
-        hotel_name = state.hotel_name or (state.search_results and state.search_results[0]['hotel_name'])
-        nights = self._calculate_nights(state.check_in_date, state.check_out_date)
-        total_price = room['price'] * nights
-
-        reply = f"""🏨 {hotel_name}
-📅 {state.check_in_date} - {state.check_out_date} ({nights}晚)
-💎 {room['room_type_name']}
-💰 价格: ¥{int(room['price'])}/晚 | 总价: ¥{int(total_price)}
-"""
-
-        if room.get('breakfast'):
-            reply += f"🍳 {room['breakfast']}\n"
-        if room.get('cancel_policy'):
-            reply += f"📝 {room['cancel_policy']}\n"
-
-        if len(state.price_results) > 1:
-            reply += f"\n还有其他房型可供选择哦~"
-
-        return {
-            'reply': reply.strip(),
-            'result': {
-                'hotel_name': hotel_name,
-                'check_in_date': state.check_in_date,
-                'check_out_date': state.check_out_date,
-                'room_type': state.room_type,
-                'price_per_night': room['price'],
-                'total_price': total_price,
-                'rooms': state.price_results
+            logger.error(f"HotelPriceAgent 处理异常: {e}")
+            return {
+                'reply': "查询过程中发生错误，请稍后重试。",
+                'complete': False,
+                'state': {'current_step': 'error', 'session_id': session_id},
+                'result': None,
             }
-        }
 
-    def _normalize_date(self, date_str: str) -> str:
-        """标准化日期格式"""
-        # 如果已经是YYYY-MM-DD，直接返回
-        import re
-        if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
-            return date_str
+    async def _preprocess_image(self, user_message: str, image_url: Optional[str],
+                                image_base64: Optional[str]) -> str:
+        """
+        预处理图片：直接调用 parse_image_tool 解析图片，将提取结果注入消息。
+        避免将巨大的 base64 字符串传给 LLM。
 
-        # 尝试其他格式
-        patterns = [
-            (r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', r'\1-\2-\3'),
-            (r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', r'\3-\1-\2'),
-        ]
-        import re
-        for pattern, repl in patterns:
-            match = re.match(pattern, date_str)
-            if match:
-                return re.sub(pattern, repl, date_str)
+        Args:
+            user_message: 原始用户消息
+            image_url: 图片URL
+            image_base64: 图片base64编码
 
-        return date_str
-
-    def _calculate_nights(self, check_in: str, check_out: str) -> int:
-        """计算晚数"""
+        Returns:
+            包含图片解析结果的增强消息
+        """
+        logger.info("检测到用户发送图片，预处理解析中...")
         try:
-            ci = datetime.strptime(check_in, '%Y-%m-%d')
-            co = datetime.strptime(check_out, '%Y-%m-%d')
-            delta = co - ci
-            return max(1, delta.days)
-        except Exception:
-            return 1
+            parsed = await self.parse_image_tool.execute(
+                image_url=image_url,
+                image_base64=image_base64,
+            )
+            if parsed.success:
+                logger.info(f"图片解析成功: {parsed.data}")
+                return f"{user_message}\n[从用户发送的酒店截图中解析出以下信息: {parsed.to_json()}]"
+            else:
+                logger.warning(f"图片解析失败: {parsed.error}")
+                return f"{user_message}\n[用户发送了一张图片但解析失败，请询问用户手动提供酒店信息]"
+        except Exception as e:
+            logger.error(f"图片预处理异常: {e}")
+            return f"{user_message}\n[图片处理出错，请用户手动输入酒店信息]"
 
-    def get_missing_info_prompt(self, state: QueryState) -> str:
-        """获取缺失信息提示"""
-        missing = state.get_missing_fields()
-        prompts = {
-            'hotel_name': "请问您要查询哪家酒店？",
-            'check_in_date': "请问入住日期是哪天？（请提供YYYY-MM-DD格式）",
-            'check_out_date': "请问离店日期是哪天？（请提供YYYY-MM-DD格式）",
-            'room_type': "请问您需要什么房型？",
-        }
-
-        for field in missing:
-            if field in prompts:
-                return prompts[field]
-
-        return "请补充完整查询信息。"
+    def clear_session(self, session_id: str):
+        """清除指定会话的历史"""
+        if session_id in self.session_histories:
+            del self.session_histories[session_id]
+            logger.info(f"已清除会话历史: {session_id}")
 
     async def close(self):
-        """关闭所有工具和服务"""
+        """关闭所有工具资源"""
         await self.search_hotel_tool.close()
         await self.query_price_tool.close()
         await self.parse_image_tool.close()
-        await self.extraction_service.close()

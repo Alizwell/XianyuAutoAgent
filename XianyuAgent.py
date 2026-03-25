@@ -110,10 +110,11 @@ class XianyuReplyBot:
                 system_prompt=self.default_prompt,
                 temperature=0.7,
             ),
-            # 酒店价格查询Agent：配置LangChain原生tools + 自定义handler
+            # 酒店价格查询Agent：使用 LangChain AgentExecutor + handler
             'hotel_query': AgentConfig(
                 chain=self._build_chain(self.hotel_query_prompt, temperature=0.4),
                 tools=hotel_tools,
+                handler=hotel_agent,
                 system_prompt=self.hotel_query_prompt,
                 temperature=0.4,
             ),
